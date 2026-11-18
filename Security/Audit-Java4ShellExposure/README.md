@@ -7,28 +7,28 @@ exploit it. Read-only: it changes nothing on the device.
 
 One script, two ways to run it:
 
-| | Interactive | RMM (Datto) |
+| | Interactive | RMM |
 |---|---|---|
-| Who runs it | You, in an elevated PowerShell window | Datto RMM, as SYSTEM, across many devices |
-| Settings | Parameters (`-LookbackDays`, `-MaxScanMinutes`) | Component variables |
-| Output | Progress, colored report, optional JSON file | Plain job output, a status in a UDF |
-| Alerting | Exit code only | Exit code 1 marks the job failed, Warning post-condition |
+| Who runs it | You, in an elevated PowerShell window | Your RMM or deployment tool, as SYSTEM, across many devices |
+| Settings | Parameters (`-LookbackDays`, `-MaxScanMinutes`) | Parameters or environment variables |
+| Output | Progress and a colored report | Plain output with a one-line `Status:` at the end |
+| Alerting | Exit code | Exit code 1 when action is needed, `Result: WARNING.` text for warnings |
 
-The script picks the mode automatically. When the Datto agent runs it, the agent's
-own variables (`CS_CC_HOST`, `CS_ACCOUNT_UID`) are present and it switches to RMM
-mode; otherwise it runs interactively. `-Mode Rmm` or `-Mode Interactive` forces one.
+The script picks the mode automatically. When it runs as SYSTEM or without an
+interactive console, which is how RMM tools run scripts, it uses RMM mode; otherwise
+it runs interactively. `-Mode Rmm` or `-Mode Interactive` forces one.
 
 ## The vulnerability in one paragraph
 
 For a few heavily used methods, the HotSpot JVM swaps in hand-written, CPU-specific
-machine code instead of running the Java version. Base64 decoding is one of them. On
-x86-64 CPUs with AVX-512 VBMI, a crafted Base64 input with a short `=` padded tail
-drives a length counter below zero, the write mask becomes all ones, and the decoder
-writes 62 bytes past the end of its buffer. Java's bounds checks never run on that
-path, and the damage happens before Java rejects the malformed input. Anything that
-decodes untrusted Base64 is a candidate: HTTP Basic auth, JWTs, SAML, cookies. That
-makes login pages of Jira, Confluence, Jenkins, Keycloak and similar apps reachable
-without authentication.
+machine code instead of running the Java version. Base64 decoding in
+`java.util.Base64` is one of them. On x86-64 CPUs with AVX-512 VBMI, a crafted Base64
+input with a short `=` padded tail drives a length counter below zero, the write mask
+becomes all ones, and the decoder writes 62 bytes past the end of its buffer. Java's
+bounds checks never run on that path, and the damage happens before Java rejects the
+malformed input. Anything that decodes untrusted Base64 is a candidate: HTTP Basic
+auth, JWTs, SAML, cookies. That makes login pages of Jira, Confluence, Jenkins,
+Keycloak and similar apps reachable without authentication.
 
 | Release line | Affected | First fixed build |
 |---|---|---|
@@ -65,50 +65,53 @@ $servers = 'APP01', 'APP02'
 Invoke-Command -ComputerName $servers -FilePath .\Audit-Java4ShellExposure.ps1 -ArgumentList 'Interactive', 30
 ```
 
+Pass `'Interactive'` when using `Invoke-Command`, because a remote session has no
+interactive console and would otherwise be treated as an RMM run.
+
 If the script is blocked because it was downloaded, run `Unblock-File
 .\Audit-Java4ShellExposure.ps1` first, or start PowerShell with `-ExecutionPolicy
 Bypass` for that session.
 
 | Parameter | Default | What it does |
 |---|---|---|
-| `-Mode` | `Auto` | `Auto` detects Datto. `Rmm` or `Interactive` forces a mode. |
+| `-Mode` | `Auto` | `Auto` detects how it is running. `Rmm` or `Interactive` forces a mode. |
 | `-LookbackDays` | 30 | Days of crash logs and event history to check, 1 to 365. |
 | `-MaxScanMinutes` | 25 | Time allowed for the drive scan, 1 to 240. Results are marked partial if hit. |
-| `-ReportPath` | none | Saves the full results as JSON. Interactive mode only. |
-| `-PassThru` | off | Also returns the results as an object. Interactive mode only. |
+| `-ReportPath` | none | Saves the full results as JSON. |
+| `-PassThru` | off | Also returns the results as an object. |
 
 `Get-Help .\Audit-Java4ShellExposure.ps1 -Full` shows the same details.
 
-## Run it from Datto RMM
+## Run it from an RMM
 
-Create a component with these settings and paste the script in unchanged:
+Add the script to your RMM as a PowerShell script that runs as **SYSTEM**, and paste
+it in unchanged.
 
-- **Name:** `Audit Java4Shell Exposure` (add your own naming prefix if you use one)
-- **Category:** Script
-- **Description:** Finds every Java runtime and rates it for Java4Shell (CVE-2026-114938) by version, AVX-512 VBMI CPU and mitigation flags, then checks crash logs and Java-spawned shells for exploitation signs. Read-only. Writes a dated status to a UDF and exits 1 when vulnerable or signs are found.
-- **Timeout:** 3600 seconds
-- **Post-condition:** Warning Text `Result: WARNING.`, warn when found (case-sensitive)
+- **Timeout:** at least 45 minutes with the default 25-minute scan budget, since the
+  JVM checks and event log queries run after the scan. Lower `MaxScanMinutes` if
+  your tool has a shorter limit.
+- **Settings:** pass `-LookbackDays` and `-MaxScanMinutes` as script arguments, or set
+  environment variables named `LookbackDays` and `MaxScanMinutes` if your tool
+  passes script variables that way. Arguments win over environment variables.
+- **Alerting:** exit code 1 means a runtime is vulnerable, a HIGH exploitation sign
+  was found, or the audit failed. Exit code 0 covers both clean and warning results;
+  if your tool can match output text, alert on `Result: WARNING.` too.
+- **Custom field:** the last line of output is `Status: ...`, one line of up to 255
+  characters, ready to copy into a device custom field if your tool supports it.
 
-| Variable | Type | Default | What it does |
-|---|---|---|---|
-| `udfNumber` | String | 24 | Which Text UDF gets the result. Pick a free one at your site. |
-| `usrLookbackDays` | String | 30 | Days of crash logs and event history to check. |
-| `usrMaxScanMinutes` | String | 25 | Minutes for the drive scan, 1 to 50, so the job finishes inside the timeout. |
-
-Run it as a Quick Job against all servers and workstations, then sort the UDF column
-for `FAIL:` first.
+Run it against all servers and workstations, then sort by status for `FAIL:` first.
 
 ## What the results mean
 
-| Result | Exit | UDF example (RMM mode) |
+| Result | Exit | Status line example |
 |---|---|---|
-| Crash in a Base64 decode frame (HIGH sign) | 1 | `FAIL: Java4Shell exploit signs \| 1 found \| see job log \| 2026-11-18` |
+| Crash in a Base64 decode frame (HIGH sign) | 1 | `FAIL: Java4Shell exploit signs \| 1 found \| see script output \| 2026-11-18` |
 | Any runtime VULNERABLE | 1 | `FAIL: Java4Shell vulnerable \| 2 of 3 runtimes \| 2026-11-18` |
-| Affected but mitigated, CPU-gated or version unknown | 0, Warning | `WARN: Java4Shell affected, not patched \| 1 runtimes \| 2026-11-18` |
-| Nothing affected, but weak signs to review | 0, Warning | `WARN: Java4Shell patched, review signs \| 2 found \| 2026-11-18` |
-| Drive scan ran out of time | 0, Warning | `WARN: Java4Shell scan incomplete \| 1 runtimes \| 2026-11-18` |
+| Affected but mitigated, CPU-gated or version unknown | 0, warning | `WARN: Java4Shell affected, not patched \| 1 runtimes \| 2026-11-18` |
+| Nothing affected, but weak signs to review | 0, warning | `WARN: Java4Shell patched, review signs \| 2 found \| 2026-11-18` |
+| Drive scan ran out of time | 0, warning | `WARN: Java4Shell scan incomplete \| 1 runtimes \| 2026-11-18` |
 | Clean | 0 | `OK: Java4Shell not vulnerable \| 3 runtimes \| 2026-11-18` |
-| Audit error | 1 | `FAIL: Java4Shell audit error \| see job log \| 2026-11-18` |
+| Audit error | 1 | `FAIL: Java4Shell audit error \| see script output \| 2026-11-18` |
 
 Each runtime gets one of: **VULNERABLE** (affected version, 64-bit, CPU exposed or not
 confirmed, no mitigation), **MITIGATED, NOT PATCHED** (machine-wide flag, or every
@@ -184,7 +187,6 @@ Verified 2026-11-18:
 - [Calif, Java4Shell write-up](https://calif.io/java4shell/), for the CPU requirement,
   affected applications and mitigation flags.
 - CISA alert "Critical Java Vulnerability Requires Immediate Patching" (2026-11-17).
-- Datto RMM documentation for agent variables, input variables and UDFs.
 
 ## License
 

@@ -9,29 +9,31 @@
 
     Runs two ways from the same file:
       Interactive  Run it yourself in an elevated PowerShell window. Shows
-                   progress and a colored report, can save a JSON report.
-      RMM          Run as a Datto RMM component. Detected automatically from
-                   the Datto agent variables. Writes a status to a UDF and
-                   exits 1 so the job shows as failed when action is needed.
+                   progress and a colored report.
+      RMM          Run it from any RMM or deployment tool as SYSTEM. Plain
+                   output, a one-line Status at the end for a custom field,
+                   and exit code 1 when action is needed.
 
 .PARAMETER Mode
-    Auto (default) picks RMM mode when Datto agent variables are present,
-    otherwise Interactive. Rmm or Interactive forces a mode.
+    Auto (default) picks RMM mode when the script runs as SYSTEM or without
+    an interactive console, otherwise Interactive. Rmm or Interactive forces
+    a mode.
 
 .PARAMETER LookbackDays
     Days of crash logs and event history to check for exploitation signs.
-    Default 30. In RMM mode the usrLookbackDays variable sets this.
+    Default 30. In RMM mode a LookbackDays environment variable also works.
 
 .PARAMETER MaxScanMinutes
     Time budget for the drive scan before it stops and reports partial
-    results. Default 25. In RMM mode the usrMaxScanMinutes variable sets this.
+    results. Default 25. In RMM mode a MaxScanMinutes environment variable
+    also works. Keep it below your RMM's script timeout.
 
 .PARAMETER ReportPath
-    Interactive mode only. Saves the full results as JSON to this file.
+    Saves the full results as JSON to this file.
 
 .PARAMETER PassThru
-    Interactive mode only. Also returns the results as an object, for use in
-    a pipeline or with Invoke-Command across several machines.
+    Also returns the results as an object, for use in a pipeline or with
+    Invoke-Command across several machines.
 
 .EXAMPLE
     .\Audit-Java4ShellExposure.ps1
@@ -52,11 +54,9 @@
     Mode, LookbackDays, MaxScanMinutes.
 
 .NOTES
-    Datto RMM component variables, read as environment variables:
-
-      udfNumber               UDF that receives the result. Default 24.
-      usrLookbackDays         Days of history to review. Default 30.
-      usrMaxScanMinutes       Drive scan time budget, 1 to 50. Default 25.
+    Settings in RMM mode come from parameters first, then from environment
+    variables named LookbackDays and MaxScanMinutes, then the defaults.
+    Most RMM tools can pass either one.
 
     CVE-2026-114938 (Java4Shell), heap out-of-bounds write in the HotSpot
     AVX-512 Base64 decode intrinsic. Affected and first fixed builds:
@@ -77,8 +77,7 @@
     Sources, verified 2026-11-18: OpenJDK Vulnerability Group and Oracle
     November 2026 CSPU as summarized by Tenable, HeroDevs, Datadog and AhnLab;
     Calif Java4Shell write-up for the CPU gate and mitigation flags; CISA
-    alert of 2026-11-17. Datto agent variables, UDF registry write-back, 300
-    UDFs and the 255-character limit per Datto RMM documentation.
+    alert of 2026-11-17.
 
     Author: Farid Lavasani (https://github.com/faridlav)
     License: Apache 2.0. Provided as-is with no warranty. Review and test it
@@ -133,9 +132,9 @@ if ($isWow64Session -and -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
     }
 }
 
-# Decide the run mode: the Datto agent sets CS_CC_HOST and CS_ACCOUNT_UID for components.
-$dattoDetected = -not [string]::IsNullOrWhiteSpace($env:CS_CC_HOST) -or
-    -not [string]::IsNullOrWhiteSpace($env:CS_ACCOUNT_UID)
+# Decide the run mode: RMM tools run scripts as SYSTEM or without a console.
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$looksUnattended = $currentIdentity.IsSystem -or -not [Environment]::UserInteractive
 switch ($Mode) {
     'Rmm' {
         $script:IsRmm = $true
@@ -144,7 +143,7 @@ switch ($Mode) {
         $script:IsRmm = $false
     }
     default {
-        $script:IsRmm = $dattoDetected
+        $script:IsRmm = $looksUnattended
     }
 }
 if (-not $script:IsRmm) {
@@ -152,10 +151,7 @@ if (-not $script:IsRmm) {
 }
 
 # Settings and CVE reference data.
-$script:ComponentTitle = 'Java4Shell CVE-2026-114938 Audit'
-$script:DefaultUdfNumber = 24
-$script:DefaultLookbackDays = 30
-$script:DefaultScanMinutes = 25
+$script:ReportTitle = 'Java4Shell CVE-2026-114938 Audit'
 $script:MaxScanDepth = 12
 $script:ProbeTimeoutSeconds = 30
 $script:MaxProbes = 10
@@ -301,7 +297,7 @@ function Write-DetailLine {
     Write-Host ($prefix + $valueText)
 }
 
-# Read numeric Datto variables with validation and documented defaults.
+# Read numeric RMM environment variables with validation and documented defaults.
 function Get-IntegerSetting {
     param(
         [Parameter(Mandatory = $true)]
@@ -330,28 +326,6 @@ function Get-IntegerSetting {
 
     $script:InvalidInputs.Add("$Name='$rawValue' ignored, using $Default")
     return $Default
-}
-
-function Set-DattoUdf {
-    param(
-        [Parameter(Mandatory = $true)]
-        [ValidateRange(1, 300)]
-        [int]$Number,
-
-        [Parameter(Mandatory = $true)]
-        [ValidateLength(1, 255)]
-        [string]$Value
-    )
-
-    $udfParams = @{
-        Path         = 'HKLM:\SOFTWARE\CentraStage'
-        Name         = "Custom$Number"
-        PropertyType = 'String'
-        Value        = $Value
-        Force        = $true
-        ErrorAction  = 'Stop'
-    }
-    New-ItemProperty @udfParams | Out-Null
 }
 
 # Runtime discovery helpers.
@@ -1163,37 +1137,31 @@ function Get-ChildProcessHistory {
     return $found
 }
 
-# Read settings: Datto variables in RMM mode, parameters when run interactively.
-$udfNumber = 0
+# Read settings: parameters first, then RMM environment variables, then defaults.
 $lookbackDays = $LookbackDays
 $scanMinutes = $MaxScanMinutes
-if ($script:IsRmm) {
-    $udfParams = @{
-        Name    = 'udfNumber'
-        Default = $script:DefaultUdfNumber
-        Minimum = 1
-        Maximum = 300
-    }
-    $udfNumber = Get-IntegerSetting @udfParams
+if ($script:IsRmm -and -not $PSBoundParameters.ContainsKey('LookbackDays')) {
     $lookbackParams = @{
-        Name    = 'usrLookbackDays'
-        Default = $script:DefaultLookbackDays
+        Name    = 'LookbackDays'
+        Default = $LookbackDays
         Minimum = 1
         Maximum = 365
     }
     $lookbackDays = Get-IntegerSetting @lookbackParams
+}
+if ($script:IsRmm -and -not $PSBoundParameters.ContainsKey('MaxScanMinutes')) {
     $scanBudgetParams = @{
-        Name    = 'usrMaxScanMinutes'
-        Default = $script:DefaultScanMinutes
+        Name    = 'MaxScanMinutes'
+        Default = $MaxScanMinutes
         Minimum = 1
-        Maximum = 50
+        Maximum = 240
     }
     $scanMinutes = Get-IntegerSetting @scanBudgetParams
 }
 $since = (Get-Date).AddDays(-$lookbackDays)
 $stamp = Get-Date -Format 'yyyy-MM-dd'
 
-Write-Host "=== $($script:ComponentTitle) ==="
+Write-Host "=== $($script:ReportTitle) ==="
 
 # Interactive runs need elevation to read other profiles, services and the Security log.
 if (-not $script:IsRmm) {
@@ -1207,15 +1175,15 @@ if (-not $script:IsRmm) {
         Write-Host 'PowerShell window so it can read every folder, service and log.'
         exit 1
     }
-    if ($ReportPath -ne '') {
-        $reportFolder = Split-Path -Path $ReportPath -Parent
-        if ($reportFolder -ne '' -and -not (Test-Path -LiteralPath $reportFolder)) {
-            $folderText = "Result: FAILED. Report folder not found: $reportFolder"
-            Write-Host $folderText -ForegroundColor Red
-            exit 1
-        }
-    }
     Write-Status -Text "Mode: interactive. Drive scan budget: $scanMinutes min."
+}
+if ($ReportPath -ne '') {
+    $reportFolder = Split-Path -Path $ReportPath -Parent
+    if ($reportFolder -ne '' -and -not (Test-Path -LiteralPath $reportFolder)) {
+        $folderText = "Result: FAILED. Report folder not found: $reportFolder"
+        Write-JobLine -Text $folderText -Color 'Red'
+        exit 1
+    }
 }
 
 # Prevent overlapping runs from scanning the same disks twice.
@@ -1586,40 +1554,41 @@ try {
 
     if ($strongSigns.Count -gt 0) {
         $resultLine = 'Result: FAILED. Possible Java4Shell exploitation signs found.'
-        $udfValue = "FAIL: Java4Shell exploit signs | $($strongSigns.Count) found | " +
-            "see job log | $stamp"
+        $statusValue = "FAIL: Java4Shell exploit signs | $($strongSigns.Count) found | " +
+            "see script output | $stamp"
         $exitCode = 1
     }
     elseif ($vulnerableCount -gt 0) {
         $resultLine = "Result: FAILED. $vulnerableCount Java runtime(s) vulnerable, " +
             'not mitigated.'
-        $udfValue = "FAIL: Java4Shell vulnerable | $vulnerableCount of $runtimeTotal " +
-            "runtimes | $stamp"
+        $statusValue = "FAIL: Java4Shell vulnerable | $vulnerableCount of " +
+            "$runtimeTotal runtimes | $stamp"
         $exitCode = 1
     }
     elseif ($reviewCount -gt 0) {
         $resultLine = "Result: WARNING. $reviewCount runtime(s) on an affected version " +
             'but not exposed now.'
-        $udfValue = "WARN: Java4Shell affected, not patched | $reviewCount runtimes | " +
-            "$stamp"
+        $statusValue = "WARN: Java4Shell affected, not patched | " +
+            "$reviewCount runtimes | $stamp"
     }
     elseif ($script:Signs.Count -gt 0) {
         $resultLine = 'Result: WARNING. Not vulnerable now, but Java crash or shell ' +
             'signs to review.'
-        $udfValue = "WARN: Java4Shell patched, review signs | $($script:Signs.Count) " +
-            "found | $stamp"
+        $statusValue = "WARN: Java4Shell patched, review signs | " +
+            "$($script:Signs.Count) found | $stamp"
     }
     elseif ($script:ScanIncomplete) {
         $resultLine = 'Result: WARNING. Folder scan hit its time budget; results partial.'
-        $udfValue = "WARN: Java4Shell scan incomplete | $runtimeTotal runtimes | $stamp"
+        $statusValue = "WARN: Java4Shell scan incomplete | $runtimeTotal runtimes | " +
+            "$stamp"
     }
     elseif ($runtimeTotal -eq 0) {
         $resultLine = 'Result: OK. No Java runtime found on this device.'
-        $udfValue = "OK: Java4Shell no Java found | $stamp"
+        $statusValue = "OK: Java4Shell no Java found | $stamp"
     }
     else {
         $resultLine = "Result: OK. No vulnerable Java runtime ($runtimeTotal checked)."
-        $udfValue = "OK: Java4Shell not vulnerable | $runtimeTotal runtimes | $stamp"
+        $statusValue = "OK: Java4Shell not vulnerable | $runtimeTotal runtimes | $stamp"
     }
 
     $resultLevel = 'OK'
@@ -1759,22 +1728,8 @@ try {
         Write-Host 'Next: no action needed for CVE-2026-114938.'
     }
 
-    # RMM mode: write the dated status to the selected UDF.
-    if ($script:IsRmm) {
-        $udfValue = Limit-Text -Text $udfValue -MaximumLength 255
-        try {
-            Set-DattoUdf -Number $udfNumber -Value $udfValue
-            Write-Host "UDF $udfNumber updated."
-        }
-        catch {
-            Write-Host "UDF $udfNumber write failed."
-            Write-JobLine -Text $_.Exception.Message
-            $exitCode = 1
-        }
-    }
-
-    # Interactive mode: build a structured report for -ReportPath and -PassThru.
-    if (-not $script:IsRmm -and ($ReportPath -ne '' -or $PassThru)) {
+    # Structured report for -ReportPath and -PassThru.
+    if ($ReportPath -ne '' -or $PassThru) {
         $runtimeRecords = [System.Collections.Generic.List[object]]::new()
         foreach ($runtime in $sortedRuntimes) {
             $processRecords = [System.Collections.Generic.List[object]]::new()
@@ -1841,20 +1796,17 @@ try {
             Write-Output $report
         }
     }
+
+    # One-line status an RMM can copy into a custom field, always the last line.
+    $statusValue = Limit-Text -Text $statusValue -MaximumLength 255
+    Write-Host ''
+    Write-Host "Status: $statusValue"
 }
 catch {
     Write-Host 'Result: FAILED. The audit stopped on an unexpected error.'
     Write-JobLine -Text $_.Exception.Message
-    if ($script:IsRmm) {
-        $errorUdfValue = "FAIL: Java4Shell audit error | see job log | $stamp"
-        try {
-            Set-DattoUdf -Number $udfNumber -Value $errorUdfValue
-        }
-        catch {
-            # The original error is already reported; a UDF failure adds nothing.
-            $null = $_
-        }
-    }
+    Write-Host ''
+    Write-Host "Status: FAIL: Java4Shell audit error | see script output | $stamp"
     $exitCode = 1
 }
 finally {
