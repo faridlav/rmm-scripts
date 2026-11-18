@@ -190,7 +190,8 @@ Verified 2026-11-18:
 
 ## License
 
-Apache 2.0, see [LICENSE](../../LICENSE). Provided as-is with no warranty. Review and
-test it before running it on devices you manage.
+Copyright 2026 Farid Lavasani. Licensed under the Apache License 2.0, see
+[LICENSE](../../LICENSE) and [NOTICE](../../NOTICE). Provided as-is with no warranty.
+Review and test it before running it on devices you manage.
 
 Author: [Farid Lavasani](https://github.com/faridlav)

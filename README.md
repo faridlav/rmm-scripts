@@ -43,7 +43,8 @@ device.
 
 ## License
 
-[Apache 2.0](LICENSE). Provided as-is with no warranty. Read and test every script
-before running it on devices you manage.
+Copyright 2026 Farid Lavasani. Licensed under the [Apache License 2.0](LICENSE); see
+[NOTICE](NOTICE). Provided as-is with no warranty. Read and test every script before
+running it on devices you manage.
 
 Maintained by [Farid Lavasani](https://github.com/faridlav).
